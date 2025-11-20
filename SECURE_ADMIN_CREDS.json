@@ -1,0 +1,40 @@
+{
+  "_warning": "⚠️ SECURITY WARNING: This file contains sensitive credentials. Never commit to version control! / تحذير أمني: يحتوي هذا الملف على بيانات اعتماد حساسة. لا تقم بإضافتها إلى نظام التحكم بالإصدارات!",
+  "_note": "These are default development credentials. MUST be changed in production! / هذه بيانات اعتماد التطوير الافتراضية. يجب تغييرها في الإنتاج!",
+  "default_admin_accounts": [
+    {
+      "user_id": "admin",
+      "email": "admin@example.com",
+      "password": "password123",
+      "full_name": "المسؤول الرئيسي",
+      "role": "admin",
+      "environment": "development"
+    },
+    {
+      "user_id": "admin1",
+      "email": "admin1@example.com",
+      "password": "Admin123!",
+      "full_name": "مسؤول النظام",
+      "role": "admin",
+      "environment": "development"
+    },
+    {
+      "user_id": "superadmin",
+      "email": "superadmin@example.com",
+      "password": "SuperAdmin123!",
+      "full_name": "المسؤول الأعلى",
+      "role": "admin",
+      "environment": "development"
+    }
+  ],
+  "usage_instructions": {
+    "en": "Use these credentials for testing and development only. Change all passwords before production deployment.",
+    "ar": "استخدم هذه البيانات للاختبار والتطوير فقط. قم بتغيير جميع كلمات المرور قبل النشر في الإنتاج."
+  },
+  "last_updated": "2025-01-27",
+  "source_files": [
+    "backend/scripts/create_default_admin.py",
+    "docs/legacy/ADMIN_ACCOUNTS.md"
+  ]
+}
+

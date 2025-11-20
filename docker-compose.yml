@@ -1,0 +1,166 @@
+# تعريف الشبكة الموحدة لضمان تواصل الحاويات
+networks:
+  app-network:
+    driver: bridge
+
+# تعريف المجلدات الدائمة لإدارة البيانات
+volumes:
+  ollama_data: {}
+  chroma_data: {}
+  neo4j_data: {}
+  app_data: {} # يمكن استخدامه لبيانات التطبيق الأخرى
+  postgres_data: {} # قاعدة بيانات PostgreSQL - لا توجد SQLite volumes
+
+# تعريف الخدمات (الحاويات)
+services:
+  # الخدمة 1: الواجهة الأمامية (Streamlit)
+  frontend:
+    build: ./frontend
+    ports:
+      - "8501:8501"
+    environment:
+      - FASTAPI_BACKEND_URL=http://backend:8000
+    depends_on:
+      - backend
+    networks:
+      - app-network
+
+  # الخدمة 2: الواجهة الخلفية (FastAPI - API Gateway)
+  backend:
+    build: ./backend
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data  # مجلد المستندات
+      - app_data:/app/app_data # مجلد لبيانات التطبيق العامة
+      - ./logs:/app/logs      # مجلد لملفات التسجيل (Logs)
+      - ./config:/app/config  # مجلد لملفات التكوين (Vibe Config)
+    environment:
+      - OLLAMA_BASE_URL=http://llm-service:11434
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
+      - CHROMA_HOST=vector-db
+      - CHROMA_PORT=8000
+      - NEO4J_URI=bolt://graph-db:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set}
+      - SECRET_KEY=${SECRET_KEY:?SECRET_KEY must be set}
+      - VERIFY_UNIVERSITY_SSL=${VERIFY_UNIVERSITY_SSL:-true}
+      - DATABASE_URL=${DATABASE_URL:?DATABASE_URL must be set}
+      - RATE_LIMIT_REDIS_URL=${RATE_LIMIT_REDIS_URL:-redis://redis:6379/0}
+      - REDIS_CACHE_URL=${REDIS_CACHE_URL:-redis://redis:6379/1}
+      - RAG_CACHE_TTL=${RAG_CACHE_TTL:-600}
+      - LLM_CACHE_TTL=${LLM_CACHE_TTL:-900}
+      - LLM_REQUEST_TIMEOUT=${LLM_REQUEST_TIMEOUT:-90}
+      - DEFAULT_FALLBACK_INTENT=${DEFAULT_FALLBACK_INTENT:-query_rag}
+      - INTENT_FALLBACK_THRESHOLD=${INTENT_FALLBACK_THRESHOLD:-0.7}
+      - GOOGLE_GEMINI_API_KEY=${GOOGLE_GEMINI_API_KEY:-}
+      - GEMINI_VISION_MODEL=${GEMINI_VISION_MODEL:-gemini-1.5-pro-vision}
+      - USE_GEMINI_OCR=${USE_GEMINI_OCR:-true}
+      - LOG_DIR=/app/logs
+    depends_on:
+      llm-service:
+        condition: service_started
+      vector-db:
+        condition: service_started
+      graph-db:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - app-network
+
+  # الخدمة 3: خادم النموذج اللغوي (Ollama)
+  llm-service:
+    image: ollama/ollama:latest
+    env_file:
+      - .env
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+      - ./scripts/ollama-entrypoint.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    environment:
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3:8b}
+    # إعدادات استخدام GPU (اختياري - قم بإلغاء التعليق إذا كان لديك GPU)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - app-network
+
+  # الخدمة 4: قاعدة بيانات المتجهات (ChromaDB)
+  vector-db:
+    image: chromadb/chroma:latest
+    ports:
+      - "8001:8000"  # نعرضه على 8001 لتجنب التعارض مع FastAPI
+    volumes:
+      - chroma_data:/chroma
+    networks:
+      - app-network
+
+  # الخدمة 5: قاعدة بيانات الرسم البياني (Neo4j)
+  graph-db:
+    image: neo4j:latest
+    env_file:
+      - .env
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - neo4j_data:/data
+    environment:
+      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set}
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - app-network
+
+  # قاعدة بيانات PostgreSQL - Production Ready
+  postgres:
+    image: postgres:15-alpine
+    env_file:
+      - .env
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-advisor_db}
+      - POSTGRES_USER=${POSTGRES_USER:-advisor}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-advisor}
+      - POSTGRES_INITDB_ARGS=--encoding=UTF-8 --lc-collate=C --lc-ctype=C
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-advisor} -d ${POSTGRES_DB:-advisor_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    networks:
+      - app-network
