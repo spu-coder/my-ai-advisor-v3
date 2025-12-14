@@ -73,6 +73,13 @@ class User(Base):
     university_password = Column(String, nullable=True)  # كلمة سر النظام الجامعي (مشفرة)
     created_at = Column(DateTime, default=datetime.utcnow)
     last_data_sync = Column(DateTime, nullable=True)  # آخر مرة تم فيها جمع البيانات من النظام الجامعي
+    
+    # Learning Style Fields (FSLSM Enhancement)
+    # حقول أسلوب التعلم (تحسين FSLSM)
+    fslsm_profile = Column(JSON, nullable=True)  # {"processing": "active", "perception": "sensing", "input": "visual", "understanding": "sequential"}
+    fslsm_confidence = Column(Float, nullable=True)  # Confidence score for ML prediction (0-1)
+    fslsm_predicted_at = Column(DateTime, nullable=True)  # When FSLSM was predicted
+    behavioral_baseline = Column(JSON, nullable=True)  # Baseline behavioral data for deviation detection
 
     # Relationships
     progress_records = relationship("ProgressRecord", back_populates="user", cascade="all, delete-orphan")
@@ -245,6 +252,69 @@ class Intervention(Base):
     
     # Relationship
     alert = relationship("AdvisorAlert", backref="interventions")
+
+class WellnessMetric(Base):
+    """
+    Wellness Metric Model - Behavioral tracking for wellness monitoring
+    نموذج مقياس العافية - تتبع سلوكي لمراقبة العافية
+    
+    Tracks individual behavioral metrics for wellness analysis
+    يتتبع المقاييس السلوكية الفردية لتحليل العافية
+    """
+    __tablename__ = "wellness_metrics"
+    id = Column(Integer, primary_key=True, index=True)
+    student_id = Column(String, ForeignKey("users.user_id"), nullable=False, index=True)
+    metric_type = Column(String, nullable=False, index=True)  # login_pattern, session_duration, late_submissions, etc.
+    metric_value = Column(Float, nullable=False)  # Current metric value
+    baseline_value = Column(Float, nullable=True)  # Baseline value for deviation detection
+    deviation_percentage = Column(Float, nullable=True)  # Percentage deviation from baseline
+    recorded_at = Column(DateTime, default=datetime.utcnow, index=True)
+    
+    # Relationship
+    student = relationship("User", foreign_keys=[student_id], backref="wellness_metrics")
+
+class WellnessAlert(Base):
+    """
+    Wellness Alert Model - Proactive wellness monitoring alerts
+    نموذج تنبيه العافية - تنبيهات مراقبة العافية الاستباقية
+    
+    Stores wellness alerts generated from behavioral pattern analysis
+    يخزن تنبيهات العافية المولدة من تحليل الأنماط السلوكية
+    """
+    __tablename__ = "wellness_alerts"
+    id = Column(Integer, primary_key=True, index=True)
+    student_id = Column(String, ForeignKey("users.user_id"), nullable=False, index=True)
+    alert_level = Column(String, nullable=False, index=True)  # info, warning, critical
+    indicators = Column(JSON, nullable=True)  # List of detected indicators
+    wellness_score = Column(Float, nullable=False)  # Overall wellness score (0-1)
+    recommended_intervention = Column(Text, nullable=True)  # Recommended intervention level
+    opt_in_status = Column(Boolean, default=True)  # Student consent for wellness monitoring
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationship
+    student = relationship("User", foreign_keys=[student_id], backref="wellness_alerts")
+
+class LearningInteraction(Base):
+    """
+    Learning Interaction Model - Tracks student learning behaviors
+    نموذج تفاعل التعلم - يتتبع سلوكيات تعلم الطالب
+    
+    Stores individual learning interactions for FSLSM ML prediction
+    يخزن تفاعلات التعلم الفردية للتنبؤ بـ FSLSM باستخدام ML
+    """
+    __tablename__ = "learning_interactions"
+    id = Column(Integer, primary_key=True, index=True)
+    student_id = Column(String, ForeignKey("users.user_id"), nullable=False, index=True)
+    interaction_type = Column(String, nullable=False, index=True)  # video_view, reading_time, forum_post, quiz_attempt, etc.
+    duration_seconds = Column(Integer, nullable=True)  # Duration of interaction in seconds
+    content_type = Column(String, nullable=True)  # visual, verbal, theoretical, practical
+    course_code = Column(String, nullable=True, index=True)  # Related course
+    metadata = Column(JSON, nullable=True)  # Additional interaction metadata
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+    
+    # Relationship
+    student = relationship("User", foreign_keys=[student_id], backref="learning_interactions")
 
 # ------------------------------------------------------------
 # Async Session Management

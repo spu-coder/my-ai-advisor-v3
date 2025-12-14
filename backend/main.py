@@ -32,6 +32,8 @@ from services import users_service, progress_service, notifications_service, doc
 from services.users_service import StudentCreate, AdminCreate, UserLogin, Token
 from services.faq_service import FAQService
 from services.advisor_alert_service import AdvisorAlertService
+from services.wellness_monitor import WellnessMonitor
+from services.learning_style_service import LearningStyleService
 
 # ------------------------------------------------------------
 # إعداد التسجيل (Logging)
@@ -1100,4 +1102,263 @@ async def get_alert(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error retrieving alert / خطأ في استرجاع التنبيه: {str(e)}"
+        )
+
+# ------------------------------------------------------------
+# Wellness Monitoring Endpoints
+# مسارات مراقبة العافية
+# ------------------------------------------------------------
+
+@app.get("/wellness/students/{student_id}", response_model=Dict[str, Any])
+async def get_student_wellness(
+    student_id: str,
+    days_window: int = Query(14, ge=7, le=30, description="Number of days to analyze / عدد الأيام للتحليل"),
+    current_user: Annotated[users_service.User, Depends(get_current_user)] = None,
+    db: Annotated[AsyncSession, Depends(get_users_session)] = None,
+):
+    """
+    Get student wellness analysis (student or advisor only)
+    / الحصول على تحليل عافية الطالب (للطالب أو المرشد فقط)
+    
+    Args:
+        student_id: Student user ID / معرف الطالب
+        days_window: Number of days to analyze / عدد الأيام للتحليل
+        current_user: Authenticated user / المستخدم المصادق عليه
+        db: Database session / جلسة قاعدة البيانات
+    
+    Returns:
+        Dictionary with wellness analysis / قاموس يحتوي على تحليل العافية
+    """
+    # Authorization: student can only view their own wellness, advisor/admin can view any
+    if current_user.role == "student" and student_id != current_user.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only view your own wellness data / يمكنك فقط عرض بيانات عافيتك الخاصة"
+        )
+    
+    if current_user.role not in ["student", "admin", "advisor"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This endpoint is only available for students, admins, and advisors"
+        )
+    
+    try:
+        monitor = WellnessMonitor(db)
+        result = await monitor.analyze_wellness(student_id, days_window)
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error analyzing wellness for student {student_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error analyzing wellness / خطأ في تحليل العافية: {str(e)}"
+        )
+
+@app.get("/wellness/alerts", response_model=List[Dict[str, Any]])
+async def get_wellness_alerts(
+    alert_level: Optional[str] = Query(None, description="Filter by alert level (yellow, red) / التصفية حسب مستوى التنبيه"),
+    limit: int = Query(50, ge=1, le=100, description="Maximum number of alerts / الحد الأقصى لعدد التنبيهات"),
+    current_user: Annotated[users_service.User, Depends(get_current_admin_user)] = None,
+    db: Annotated[AsyncSession, Depends(get_users_session)] = None,
+):
+    """
+    Get wellness alerts (admin/advisor only)
+    / الحصول على تنبيهات العافية (للإداريين والمرشدين فقط)
+    
+    Args:
+        alert_level: Optional filter by alert level / مرشح مستوى التنبيه الاختياري
+        limit: Maximum number of alerts / الحد الأقصى لعدد التنبيهات
+        current_user: Authenticated admin/advisor user / المستخدم الإداري/المرشد المصادق عليه
+        db: Database session / جلسة قاعدة البيانات
+    
+    Returns:
+        List of wellness alert dictionaries / قائمة قواميس تنبيهات العافية
+    """
+    if current_user.role not in ["admin", "advisor"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This endpoint is only available for admins and advisors / هذه النقطة متاحة فقط للإداريين والمرشدين"
+        )
+    
+    try:
+        monitor = WellnessMonitor(db)
+        alerts = await monitor.get_wellness_alerts(alert_level=alert_level, limit=limit)
+        
+        return [
+            {
+                "id": alert.id,
+                "student_id": alert.student_id,
+                "alert_level": alert.alert_level,
+                "wellness_score": alert.wellness_score,
+                "indicators": alert.indicators,
+                "recommended_intervention": alert.recommended_intervention,
+                "created_at": alert.created_at.isoformat() if alert.created_at else None,
+                "updated_at": alert.updated_at.isoformat() if alert.updated_at else None,
+            }
+            for alert in alerts
+        ]
+        
+    except Exception as e:
+        logger.error(f"Error getting wellness alerts: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error retrieving wellness alerts / خطأ في استرجاع تنبيهات العافية: {str(e)}"
+        )
+
+@app.get("/wellness/students/{student_id}/history", response_model=List[Dict[str, Any]])
+async def get_student_wellness_history(
+    student_id: str,
+    limit: int = Query(30, ge=1, le=100, description="Maximum number of records / الحد الأقصى لعدد السجلات"),
+    current_user: Annotated[users_service.User, Depends(get_current_user)] = None,
+    db: Annotated[AsyncSession, Depends(get_users_session)] = None,
+):
+    """
+    Get student wellness history (student or advisor only)
+    / الحصول على تاريخ عافية الطالب (للطالب أو المرشد فقط)
+    
+    Args:
+        student_id: Student user ID / معرف الطالب
+        limit: Maximum number of records / الحد الأقصى لعدد السجلات
+        current_user: Authenticated user / المستخدم المصادق عليه
+        db: Database session / جلسة قاعدة البيانات
+    
+    Returns:
+        List of wellness history dictionaries / قائمة قواميس تاريخ العافية
+    """
+    # Authorization: student can only view their own history, advisor/admin can view any
+    if current_user.role == "student" and student_id != current_user.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only view your own wellness history / يمكنك فقط عرض تاريخ عافيتك الخاصة"
+        )
+    
+    if current_user.role not in ["student", "admin", "advisor"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This endpoint is only available for students, admins, and advisors"
+        )
+    
+    try:
+        monitor = WellnessMonitor(db)
+        history = await monitor.get_student_wellness_history(student_id, limit)
+        
+        return history
+        
+    except Exception as e:
+        logger.error(f"Error getting wellness history for {student_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error retrieving wellness history / خطأ في استرجاع تاريخ العافية: {str(e)}"
+        )
+
+# ------------------------------------------------------------
+# Learning Style Endpoints
+# مسارات أسلوب التعلم
+# ------------------------------------------------------------
+
+@app.get("/learning-style/students/{student_id}", response_model=Dict[str, Any])
+async def get_student_learning_style(
+    student_id: str,
+    use_ml: bool = Query(True, description="Use ML prediction / استخدام التنبؤ بـ ML"),
+    current_user: Annotated[users_service.User, Depends(get_current_user)] = None,
+    db: Annotated[AsyncSession, Depends(get_users_session)] = None,
+):
+    """
+    Get student learning style prediction (FSLSM)
+    / الحصول على تنبؤ أسلوب تعلم الطالب (FSLSM)
+    
+    Args:
+        student_id: Student user ID / معرف الطالب
+        use_ml: Whether to use ML prediction / ما إذا كان سيتم استخدام التنبؤ بـ ML
+        current_user: Authenticated user / المستخدم المصادق عليه
+        db: Database session / جلسة قاعدة البيانات
+    
+    Returns:
+        Dictionary with learning style prediction / قاموس يحتوي على تنبؤ أسلوب التعلم
+    """
+    # Authorization: student can only view their own style, advisor/admin can view any
+    if current_user.role == "student" and student_id != current_user.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only view your own learning style / يمكنك فقط عرض أسلوب تعلمك الخاص"
+        )
+    
+    if current_user.role not in ["student", "admin", "advisor"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This endpoint is only available for students, admins, and advisors"
+        )
+    
+    try:
+        service = LearningStyleService(db)
+        result = await service.predict_learning_style(student_id, use_ml_prediction=use_ml)
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error predicting learning style for {student_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error predicting learning style / خطأ في التنبؤ بأسلوب التعلم: {str(e)}"
+        )
+
+class LearningInteractionRequest(BaseModel):
+    """Request model for logging learning interaction / نموذج طلب تسجيل تفاعل التعلم"""
+    interaction_type: str = Field(..., description="Type of interaction / نوع التفاعل")
+    duration_seconds: Optional[int] = Field(None, description="Duration in seconds / المدة بالثواني")
+    content_type: Optional[str] = Field(None, description="Content type / نوع المحتوى")
+    course_code: Optional[str] = Field(None, description="Course code / رمز المقرر")
+    metadata: Optional[Dict[str, Any]] = Field(None, description="Additional metadata / بيانات وصفية إضافية")
+
+@app.post("/learning-style/interactions", response_model=Dict[str, Any])
+async def log_learning_interaction(
+    interaction: LearningInteractionRequest,
+    current_user: Annotated[users_service.User, Depends(get_current_user)] = None,
+    db: Annotated[AsyncSession, Depends(get_users_session)] = None,
+):
+    """
+    Log a learning interaction (for ML prediction)
+    / تسجيل تفاعل تعلم (للتنبؤ بـ ML)
+    
+    Args:
+        interaction: Interaction data / بيانات التفاعل
+        current_user: Authenticated user / المستخدم المصادق عليه
+        db: Database session / جلسة قاعدة البيانات
+    
+    Returns:
+        Dictionary with logged interaction / قاموس يحتوي على التفاعل المسجل
+    """
+    if current_user.role != "student":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This endpoint is only available for students / هذه النقطة متاحة فقط للطلاب"
+        )
+    
+    try:
+        service = LearningStyleService(db)
+        logged_interaction = await service.log_interaction(
+            student_id=current_user.user_id,
+            interaction_type=interaction.interaction_type,
+            duration_seconds=interaction.duration_seconds,
+            content_type=interaction.content_type,
+            course_code=interaction.course_code,
+            metadata=interaction.metadata
+        )
+        
+        return {
+            "id": logged_interaction.id,
+            "student_id": logged_interaction.student_id,
+            "interaction_type": logged_interaction.interaction_type,
+            "duration_seconds": logged_interaction.duration_seconds,
+            "content_type": logged_interaction.content_type,
+            "course_code": logged_interaction.course_code,
+            "timestamp": logged_interaction.timestamp.isoformat() if logged_interaction.timestamp else None
+        }
+        
+    except Exception as e:
+        logger.error(f"Error logging learning interaction: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error logging interaction / خطأ في تسجيل التفاعل: {str(e)}"
         )
