@@ -150,6 +150,102 @@ class ChatMessage(Base):
     # Relationship
     user = relationship("User", back_populates="chat_messages")
 
+class FAQEntry(Base):
+    """
+    FAQ Entry Model - Unified RAG (URAG) System
+    نموذج سؤال شائع - نظام URAG (Unified RAG)
+    
+    Stores exact factual answers for 100% accuracy
+    يخزن إجابات دقيقة 100% للأسئلة الواقعية
+    """
+    __tablename__ = "faq_entries"
+    id = Column(Integer, primary_key=True, index=True)
+    question_pattern = Column(String, nullable=False, index=True)  # Regex pattern for matching
+    answer_template = Column(Text, nullable=False)  # Exact answer template
+    category = Column(String, nullable=False, index=True)  # regulations, fees, deadlines, etc.
+    priority = Column(Integer, default=1)  # For ordering (higher = more important)
+    metadata = Column(JSON, nullable=True)  # department, year, status, etc.
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    is_active = Column(Boolean, default=True, index=True)  # Enable/disable FAQ entry
+
+class FAQMatchLog(Base):
+    """
+    FAQ Match Log - Analytics for URAG System
+    سجل مطابقة الأسئلة الشائعة - تحليلات لنظام URAG
+    
+    Tracks FAQ matches for analytics and improvement
+    يتتبع مطابقات الأسئلة الشائعة للتحليلات والتحسين
+    """
+    __tablename__ = "faq_match_logs"
+    id = Column(Integer, primary_key=True, index=True)
+    user_query = Column(Text, nullable=False)  # Original user query
+    matched_faq_id = Column(Integer, ForeignKey("faq_entries.id"), nullable=True, index=True)
+    confidence_score = Column(Float, nullable=True)  # Match confidence (0-1)
+    used_llm_fallback = Column(Boolean, default=False)  # Whether RAG was used as fallback
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+    
+    # Relationship
+    faq_entry = relationship("FAQEntry", foreign_keys=[matched_faq_id])
+
+class AdvisorAlert(Base):
+    """
+    Advisor Alert Model - Advisor-in-the-Loop System
+    نموذج تنبيه المرشد - نظام المرشد-في-الحلقة
+    
+    Stores alerts generated from predictions for advisor review
+    يخزن التنبيهات المولدة من التنبؤات لمراجعة المرشد
+    """
+    __tablename__ = "advisor_alerts"
+    id = Column(Integer, primary_key=True, index=True)
+    student_id = Column(String, ForeignKey("users.user_id"), nullable=False, index=True)
+    alert_type = Column(String, nullable=False, index=True)  # academic_risk, wellness_concern, behavioral_change
+    risk_level = Column(String, nullable=False, index=True)  # low, medium, high, critical
+    description = Column(Text, nullable=False)  # Human-readable description
+    
+    # Feature Importance (for transparency)
+    # أهمية الميزات (للشفافية)
+    contributing_factors = Column(JSON, nullable=True)  # {"low_attendance": 0.4, "poor_prereq_grade": 0.3, ...}
+    
+    prediction_confidence = Column(Float, nullable=True)  # Prediction confidence (0-1)
+    
+    # Advisor action fields
+    # حقول إجراء المرشد
+    advisor_id = Column(String, ForeignKey("users.user_id"), nullable=True, index=True)  # Assigned advisor
+    status = Column(String, default="pending", index=True)  # pending, reviewed, actioned, dismissed
+    advisor_notes = Column(Text, nullable=True)  # Advisor's notes/actions taken
+    actioned_at = Column(DateTime, nullable=True)  # When advisor took action
+    
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    student = relationship("User", foreign_keys=[student_id], backref="student_alerts")
+    advisor = relationship("User", foreign_keys=[advisor_id], backref="advisor_alerts")
+
+class Intervention(Base):
+    """
+    Intervention Model - Records advisor actions
+    نموذج التدخل - يسجل إجراءات المرشد
+    
+    Tracks interventions taken by advisors in response to alerts
+    يتتبع التدخلات التي يتخذها المرشدون استجابة للتنبيهات
+    """
+    __tablename__ = "interventions"
+    id = Column(Integer, primary_key=True, index=True)
+    alert_id = Column(Integer, ForeignKey("advisor_alerts.id"), nullable=False, index=True)
+    intervention_type = Column(String, nullable=False)  # email, meeting, resource_suggestion, etc.
+    description = Column(Text, nullable=False)  # Description of intervention
+    scheduled_at = Column(DateTime, nullable=True)  # When intervention is scheduled
+    completed_at = Column(DateTime, nullable=True)  # When intervention was completed
+    effectiveness_rating = Column(Integer, nullable=True)  # 1-5 rating from student feedback
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationship
+    alert = relationship("AdvisorAlert", backref="interventions")
+
 # ------------------------------------------------------------
 # Async Session Management
 # ------------------------------------------------------------

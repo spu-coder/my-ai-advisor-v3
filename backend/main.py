@@ -30,6 +30,8 @@ from security_middleware import (
 )
 from services import users_service, progress_service, notifications_service, documents_service, graph_service, llm_service
 from services.users_service import StudentCreate, AdminCreate, UserLogin, Token
+from services.faq_service import FAQService
+from services.advisor_alert_service import AdvisorAlertService
 
 # ------------------------------------------------------------
 # إعداد التسجيل (Logging)
@@ -636,12 +638,18 @@ async def chat_with_advisor(
         # إعداد ServiceAdapter لفصل LLM Service عن قاعدة البيانات
         # Setup ServiceAdapter to decouple LLM Service from database
         from services.service_interface import ServiceAdapter
+        
+        # Initialize FAQ Service for URAG
+        # تهيئة خدمة FAQ لـ URAG
+        faq_service = FAQService(db_users)
+        
         service_adapter = ServiceAdapter(
             documents_service=documents_service,
             progress_service=progress_service,
             graph_service=graph_service,
             progress_db=db_progress,
             users_db=db_users,
+            faq_service=faq_service,  # NEW: Add FAQ Service for URAG
         )
         
         # استخدام user_id فعال (None للوضع التجريبي)
@@ -886,3 +894,210 @@ async def health_check() -> Dict[str, str]:
         Dictionary with service status / قاموس يحتوي على حالة الخدمة
     """
     return {"status": "ok", "service": "API Gateway"}
+
+# ------------------------------------------------------------
+# Advisor Dashboard Endpoints
+# مسارات لوحة تحكم المرشد
+# ------------------------------------------------------------
+
+@app.get("/advisor/alerts/pending", response_model=List[Dict[str, Any]])
+async def get_pending_alerts(
+    priority: Optional[str] = Query(None, description="Filter by priority (high, medium, low, critical) / التصفية حسب الأولوية"),
+    limit: int = Query(50, ge=1, le=100, description="Maximum number of alerts / الحد الأقصى لعدد التنبيهات"),
+    current_user: Annotated[users_service.User, Depends(get_current_admin_user)] = None,
+    db: Annotated[AsyncSession, Depends(get_users_session)] = None,
+):
+    """
+    Get pending alerts for advisor review (admin/advisor only)
+    / الحصول على التنبيهات المعلّقة للمراجعة (للإداريين والمرشدين فقط)
+    
+    Args:
+        priority: Optional priority filter / مرشح الأولوية الاختياري
+        limit: Maximum number of alerts / الحد الأقصى لعدد التنبيهات
+        current_user: Authenticated admin/advisor user / المستخدم الإداري/المرشد المصادق عليه
+        db: Database session / جلسة قاعدة البيانات
+    
+    Returns:
+        List of alert dictionaries / قائمة قواميس التنبيهات
+    """
+    # Check if user is admin or advisor
+    if current_user.role not in ["admin", "advisor"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This endpoint is only available for admins and advisors / هذه النقطة متاحة فقط للإداريين والمرشدين"
+        )
+    
+    try:
+        service = AdvisorAlertService(db)
+        alerts = await service.get_pending_alerts(
+            advisor_id=current_user.user_id if current_user.role == "advisor" else None,
+            priority=priority,
+            limit=limit
+        )
+        
+        # Convert to dictionaries
+        alerts_dict = []
+        for alert in alerts:
+            alerts_dict.append({
+                "id": alert.id,
+                "student_id": alert.student_id,
+                "alert_type": alert.alert_type,
+                "risk_level": alert.risk_level,
+                "description": alert.description,
+                "contributing_factors": alert.contributing_factors,
+                "prediction_confidence": alert.prediction_confidence,
+                "advisor_id": alert.advisor_id,
+                "status": alert.status,
+                "advisor_notes": alert.advisor_notes,
+                "created_at": alert.created_at.isoformat() if alert.created_at else None,
+                "actioned_at": alert.actioned_at.isoformat() if alert.actioned_at else None,
+            })
+        
+        return alerts_dict
+        
+    except Exception as e:
+        logger.error(f"Error getting pending alerts: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error retrieving alerts / خطأ في استرجاع التنبيهات: {str(e)}"
+        )
+
+class AdvisorActionRequest(BaseModel):
+    """Request model for advisor action / نموذج طلب إجراء المرشد"""
+    action_type: str = Field(..., description="Type of action (email, meeting, resource_suggestion, dismiss) / نوع الإجراء")
+    notes: str = Field(..., min_length=1, description="Advisor notes / ملاحظات المرشد")
+    scheduled_at: Optional[str] = Field(None, description="Scheduled time (ISO format) / الوقت المجدول (صيغة ISO)")
+
+@app.post("/advisor/alerts/{alert_id}/action", response_model=Dict[str, Any])
+async def action_alert(
+    alert_id: int,
+    action: AdvisorActionRequest,
+    current_user: Annotated[users_service.User, Depends(get_current_admin_user)] = None,
+    db: Annotated[AsyncSession, Depends(get_users_session)] = None,
+):
+    """
+    Take action on alert (admin/advisor only)
+    / اتخاذ إجراء على التنبيه (للإداريين والمرشدين فقط)
+    
+    Args:
+        alert_id: Alert ID / معرف التنبيه
+        action: Action request / طلب الإجراء
+        current_user: Authenticated admin/advisor user / المستخدم الإداري/المرشد المصادق عليه
+        db: Database session / جلسة قاعدة البيانات
+    
+    Returns:
+        Dictionary with intervention details / قاموس يحتوي على تفاصيل التدخل
+    """
+    # Check if user is admin or advisor
+    if current_user.role not in ["admin", "advisor"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This endpoint is only available for admins and advisors / هذه النقطة متاحة فقط للإداريين والمرشدين"
+        )
+    
+    try:
+        service = AdvisorAlertService(db)
+        
+        # Parse scheduled_at if provided
+        scheduled_at = None
+        if action.scheduled_at:
+            from datetime import datetime
+            scheduled_at = datetime.fromisoformat(action.scheduled_at.replace('Z', '+00:00'))
+        
+        intervention = await service.action_alert(
+            alert_id=alert_id,
+            advisor_id=current_user.user_id,
+            action_type=action.action_type,
+            notes=action.notes,
+            scheduled_at=scheduled_at
+        )
+        
+        return {
+            "id": intervention.id,
+            "alert_id": intervention.alert_id,
+            "intervention_type": intervention.intervention_type,
+            "description": intervention.description,
+            "scheduled_at": intervention.scheduled_at.isoformat() if intervention.scheduled_at else None,
+            "completed_at": intervention.completed_at.isoformat() if intervention.completed_at else None,
+            "created_at": intervention.created_at.isoformat() if intervention.created_at else None,
+        }
+        
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        logger.error(f"Error taking action on alert {alert_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error processing action / خطأ في معالجة الإجراء: {str(e)}"
+        )
+
+@app.get("/advisor/alerts/{alert_id}", response_model=Dict[str, Any])
+async def get_alert(
+    alert_id: int,
+    current_user: Annotated[users_service.User, Depends(get_current_admin_user)] = None,
+    db: Annotated[AsyncSession, Depends(get_users_session)] = None,
+):
+    """
+    Get alert by ID (admin/advisor only)
+    / الحصول على تنبيه بالمعرف (للإداريين والمرشدين فقط)
+    
+    Args:
+        alert_id: Alert ID / معرف التنبيه
+        current_user: Authenticated admin/advisor user / المستخدم الإداري/المرشد المصادق عليه
+        db: Database session / جلسة قاعدة البيانات
+    
+    Returns:
+        Alert dictionary / قاموس التنبيه
+    """
+    if current_user.role not in ["admin", "advisor"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This endpoint is only available for admins and advisors / هذه النقطة متاحة فقط للإداريين والمرشدين"
+        )
+    
+    try:
+        service = AdvisorAlertService(db)
+        alert = await service.get_alert_by_id(alert_id)
+        
+        if not alert:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Alert not found / التنبيه غير موجود"
+            )
+        
+        return {
+            "id": alert.id,
+            "student_id": alert.student_id,
+            "alert_type": alert.alert_type,
+            "risk_level": alert.risk_level,
+            "description": alert.description,
+            "contributing_factors": alert.contributing_factors,
+            "prediction_confidence": alert.prediction_confidence,
+            "advisor_id": alert.advisor_id,
+            "status": alert.status,
+            "advisor_notes": alert.advisor_notes,
+            "created_at": alert.created_at.isoformat() if alert.created_at else None,
+            "actioned_at": alert.actioned_at.isoformat() if alert.actioned_at else None,
+            "interventions": [
+                {
+                    "id": i.id,
+                    "intervention_type": i.intervention_type,
+                    "description": i.description,
+                    "scheduled_at": i.scheduled_at.isoformat() if i.scheduled_at else None,
+                    "completed_at": i.completed_at.isoformat() if i.completed_at else None,
+                }
+                for i in alert.interventions
+            ] if alert.interventions else []
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting alert {alert_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error retrieving alert / خطأ في استرجاع التنبيه: {str(e)}"
+        )
