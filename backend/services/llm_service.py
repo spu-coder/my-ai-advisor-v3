@@ -374,10 +374,33 @@ async def process_agentic_query(
     
     # 3. توجيه السؤال بناءً على النية
     
-    # 3.1. استعلام RAG (المستندات)
+    # 3.1. استعلام RAG (المستندات) - Enhanced with URAG
     if intent == "query_rag":
-        context_str, source_info = service_adapter.retrieve_context(question)
+        # Get student context for FAQ filtering (if available)
+        student_context = None
+        if user_id and not is_demo:
+            try:
+                # Try to get student metadata for context-aware FAQ filtering
+                # This is a simplified version - can be enhanced with actual student data
+                student_context = await service_adapter.get_student_context(user_id) if hasattr(service_adapter, 'get_student_context') else None
+            except Exception:
+                pass  # Continue without context if unavailable
         
+        # Use URAG: Try FAQ first, then RAG fallback
+        context_str, source_info, faq_result = await service_adapter.retrieve_context_with_urag(
+            question=question,
+            metadata_context=student_context
+        )
+        
+        # If FAQ match found, return immediately (100% accuracy)
+        if faq_result:
+            return LLMResponse(
+                answer=context_str,  # This is the FAQ answer
+                source=source_info,  # e.g., "FAQ (FAQ Entry #1)"
+                intent=intent
+            )
+        
+        # Otherwise, use RAG context
         if context_str:
             rag_prompt = f"""
             أنت "مرشدي الأكاديمي الذكي".

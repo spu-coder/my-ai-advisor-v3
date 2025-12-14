@@ -30,6 +30,12 @@ from security_middleware import (
 )
 from services import users_service, progress_service, notifications_service, documents_service, graph_service, llm_service
 from services.users_service import StudentCreate, AdminCreate, UserLogin, Token
+from services.faq_service import FAQService
+from services.advisor_alert_service import AdvisorAlertService
+from services.wellness_monitor import WellnessMonitor
+from services.learning_style_service import LearningStyleService
+from services.peer_matching_service import PeerMatchingService
+from services.bulk_csv_importer import BulkCSVImporter
 
 # ------------------------------------------------------------
 # إعداد التسجيل (Logging)
@@ -636,12 +642,18 @@ async def chat_with_advisor(
         # إعداد ServiceAdapter لفصل LLM Service عن قاعدة البيانات
         # Setup ServiceAdapter to decouple LLM Service from database
         from services.service_interface import ServiceAdapter
+        
+        # Initialize FAQ Service for URAG
+        # تهيئة خدمة FAQ لـ URAG
+        faq_service = FAQService(db_users)
+        
         service_adapter = ServiceAdapter(
             documents_service=documents_service,
             progress_service=progress_service,
             graph_service=graph_service,
             progress_db=db_progress,
             users_db=db_users,
+            faq_service=faq_service,  # NEW: Add FAQ Service for URAG
         )
         
         # استخدام user_id فعال (None للوضع التجريبي)
@@ -886,3 +898,700 @@ async def health_check() -> Dict[str, str]:
         Dictionary with service status / قاموس يحتوي على حالة الخدمة
     """
     return {"status": "ok", "service": "API Gateway"}
+
+# ------------------------------------------------------------
+# Advisor Dashboard Endpoints
+# مسارات لوحة تحكم المرشد
+# ------------------------------------------------------------
+
+@app.get("/advisor/alerts/pending", response_model=List[Dict[str, Any]])
+async def get_pending_alerts(
+    priority: Optional[str] = Query(None, description="Filter by priority (high, medium, low, critical) / التصفية حسب الأولوية"),
+    limit: int = Query(50, ge=1, le=100, description="Maximum number of alerts / الحد الأقصى لعدد التنبيهات"),
+    current_user: Annotated[users_service.User, Depends(get_current_admin_user)] = None,
+    db: Annotated[AsyncSession, Depends(get_users_session)] = None,
+):
+    """
+    Get pending alerts for advisor review (admin/advisor only)
+    / الحصول على التنبيهات المعلّقة للمراجعة (للإداريين والمرشدين فقط)
+    
+    Args:
+        priority: Optional priority filter / مرشح الأولوية الاختياري
+        limit: Maximum number of alerts / الحد الأقصى لعدد التنبيهات
+        current_user: Authenticated admin/advisor user / المستخدم الإداري/المرشد المصادق عليه
+        db: Database session / جلسة قاعدة البيانات
+    
+    Returns:
+        List of alert dictionaries / قائمة قواميس التنبيهات
+    """
+    # Check if user is admin or advisor
+    if current_user.role not in ["admin", "advisor"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This endpoint is only available for admins and advisors / هذه النقطة متاحة فقط للإداريين والمرشدين"
+        )
+    
+    try:
+        service = AdvisorAlertService(db)
+        alerts = await service.get_pending_alerts(
+            advisor_id=current_user.user_id if current_user.role == "advisor" else None,
+            priority=priority,
+            limit=limit
+        )
+        
+        # Convert to dictionaries
+        alerts_dict = []
+        for alert in alerts:
+            alerts_dict.append({
+                "id": alert.id,
+                "student_id": alert.student_id,
+                "alert_type": alert.alert_type,
+                "risk_level": alert.risk_level,
+                "description": alert.description,
+                "contributing_factors": alert.contributing_factors,
+                "prediction_confidence": alert.prediction_confidence,
+                "advisor_id": alert.advisor_id,
+                "status": alert.status,
+                "advisor_notes": alert.advisor_notes,
+                "created_at": alert.created_at.isoformat() if alert.created_at else None,
+                "actioned_at": alert.actioned_at.isoformat() if alert.actioned_at else None,
+            })
+        
+        return alerts_dict
+        
+    except Exception as e:
+        logger.error(f"Error getting pending alerts: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error retrieving alerts / خطأ في استرجاع التنبيهات: {str(e)}"
+        )
+
+class AdvisorActionRequest(BaseModel):
+    """Request model for advisor action / نموذج طلب إجراء المرشد"""
+    action_type: str = Field(..., description="Type of action (email, meeting, resource_suggestion, dismiss) / نوع الإجراء")
+    notes: str = Field(..., min_length=1, description="Advisor notes / ملاحظات المرشد")
+    scheduled_at: Optional[str] = Field(None, description="Scheduled time (ISO format) / الوقت المجدول (صيغة ISO)")
+
+@app.post("/advisor/alerts/{alert_id}/action", response_model=Dict[str, Any])
+async def action_alert(
+    alert_id: int,
+    action: AdvisorActionRequest,
+    current_user: Annotated[users_service.User, Depends(get_current_admin_user)] = None,
+    db: Annotated[AsyncSession, Depends(get_users_session)] = None,
+):
+    """
+    Take action on alert (admin/advisor only)
+    / اتخاذ إجراء على التنبيه (للإداريين والمرشدين فقط)
+    
+    Args:
+        alert_id: Alert ID / معرف التنبيه
+        action: Action request / طلب الإجراء
+        current_user: Authenticated admin/advisor user / المستخدم الإداري/المرشد المصادق عليه
+        db: Database session / جلسة قاعدة البيانات
+    
+    Returns:
+        Dictionary with intervention details / قاموس يحتوي على تفاصيل التدخل
+    """
+    # Check if user is admin or advisor
+    if current_user.role not in ["admin", "advisor"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This endpoint is only available for admins and advisors / هذه النقطة متاحة فقط للإداريين والمرشدين"
+        )
+    
+    try:
+        service = AdvisorAlertService(db)
+        
+        # Parse scheduled_at if provided
+        scheduled_at = None
+        if action.scheduled_at:
+            from datetime import datetime
+            scheduled_at = datetime.fromisoformat(action.scheduled_at.replace('Z', '+00:00'))
+        
+        intervention = await service.action_alert(
+            alert_id=alert_id,
+            advisor_id=current_user.user_id,
+            action_type=action.action_type,
+            notes=action.notes,
+            scheduled_at=scheduled_at
+        )
+        
+        return {
+            "id": intervention.id,
+            "alert_id": intervention.alert_id,
+            "intervention_type": intervention.intervention_type,
+            "description": intervention.description,
+            "scheduled_at": intervention.scheduled_at.isoformat() if intervention.scheduled_at else None,
+            "completed_at": intervention.completed_at.isoformat() if intervention.completed_at else None,
+            "created_at": intervention.created_at.isoformat() if intervention.created_at else None,
+        }
+        
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        logger.error(f"Error taking action on alert {alert_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error processing action / خطأ في معالجة الإجراء: {str(e)}"
+        )
+
+@app.get("/advisor/alerts/{alert_id}", response_model=Dict[str, Any])
+async def get_alert(
+    alert_id: int,
+    current_user: Annotated[users_service.User, Depends(get_current_admin_user)] = None,
+    db: Annotated[AsyncSession, Depends(get_users_session)] = None,
+):
+    """
+    Get alert by ID (admin/advisor only)
+    / الحصول على تنبيه بالمعرف (للإداريين والمرشدين فقط)
+    
+    Args:
+        alert_id: Alert ID / معرف التنبيه
+        current_user: Authenticated admin/advisor user / المستخدم الإداري/المرشد المصادق عليه
+        db: Database session / جلسة قاعدة البيانات
+    
+    Returns:
+        Alert dictionary / قاموس التنبيه
+    """
+    if current_user.role not in ["admin", "advisor"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This endpoint is only available for admins and advisors / هذه النقطة متاحة فقط للإداريين والمرشدين"
+        )
+    
+    try:
+        service = AdvisorAlertService(db)
+        alert = await service.get_alert_by_id(alert_id)
+        
+        if not alert:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Alert not found / التنبيه غير موجود"
+            )
+        
+        return {
+            "id": alert.id,
+            "student_id": alert.student_id,
+            "alert_type": alert.alert_type,
+            "risk_level": alert.risk_level,
+            "description": alert.description,
+            "contributing_factors": alert.contributing_factors,
+            "prediction_confidence": alert.prediction_confidence,
+            "advisor_id": alert.advisor_id,
+            "status": alert.status,
+            "advisor_notes": alert.advisor_notes,
+            "created_at": alert.created_at.isoformat() if alert.created_at else None,
+            "actioned_at": alert.actioned_at.isoformat() if alert.actioned_at else None,
+            "interventions": [
+                {
+                    "id": i.id,
+                    "intervention_type": i.intervention_type,
+                    "description": i.description,
+                    "scheduled_at": i.scheduled_at.isoformat() if i.scheduled_at else None,
+                    "completed_at": i.completed_at.isoformat() if i.completed_at else None,
+                }
+                for i in alert.interventions
+            ] if alert.interventions else []
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting alert {alert_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error retrieving alert / خطأ في استرجاع التنبيه: {str(e)}"
+        )
+
+# ------------------------------------------------------------
+# Wellness Monitoring Endpoints
+# مسارات مراقبة العافية
+# ------------------------------------------------------------
+
+@app.get("/wellness/students/{student_id}", response_model=Dict[str, Any])
+async def get_student_wellness(
+    student_id: str,
+    days_window: int = Query(14, ge=7, le=30, description="Number of days to analyze / عدد الأيام للتحليل"),
+    current_user: Annotated[users_service.User, Depends(get_current_user)] = None,
+    db: Annotated[AsyncSession, Depends(get_users_session)] = None,
+):
+    """
+    Get student wellness analysis (student or advisor only)
+    / الحصول على تحليل عافية الطالب (للطالب أو المرشد فقط)
+    
+    Args:
+        student_id: Student user ID / معرف الطالب
+        days_window: Number of days to analyze / عدد الأيام للتحليل
+        current_user: Authenticated user / المستخدم المصادق عليه
+        db: Database session / جلسة قاعدة البيانات
+    
+    Returns:
+        Dictionary with wellness analysis / قاموس يحتوي على تحليل العافية
+    """
+    # Authorization: student can only view their own wellness, advisor/admin can view any
+    if current_user.role == "student" and student_id != current_user.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only view your own wellness data / يمكنك فقط عرض بيانات عافيتك الخاصة"
+        )
+    
+    if current_user.role not in ["student", "admin", "advisor"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This endpoint is only available for students, admins, and advisors"
+        )
+    
+    try:
+        monitor = WellnessMonitor(db)
+        result = await monitor.analyze_wellness(student_id, days_window)
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error analyzing wellness for student {student_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error analyzing wellness / خطأ في تحليل العافية: {str(e)}"
+        )
+
+@app.get("/wellness/alerts", response_model=List[Dict[str, Any]])
+async def get_wellness_alerts(
+    alert_level: Optional[str] = Query(None, description="Filter by alert level (yellow, red) / التصفية حسب مستوى التنبيه"),
+    limit: int = Query(50, ge=1, le=100, description="Maximum number of alerts / الحد الأقصى لعدد التنبيهات"),
+    current_user: Annotated[users_service.User, Depends(get_current_admin_user)] = None,
+    db: Annotated[AsyncSession, Depends(get_users_session)] = None,
+):
+    """
+    Get wellness alerts (admin/advisor only)
+    / الحصول على تنبيهات العافية (للإداريين والمرشدين فقط)
+    
+    Args:
+        alert_level: Optional filter by alert level / مرشح مستوى التنبيه الاختياري
+        limit: Maximum number of alerts / الحد الأقصى لعدد التنبيهات
+        current_user: Authenticated admin/advisor user / المستخدم الإداري/المرشد المصادق عليه
+        db: Database session / جلسة قاعدة البيانات
+    
+    Returns:
+        List of wellness alert dictionaries / قائمة قواميس تنبيهات العافية
+    """
+    if current_user.role not in ["admin", "advisor"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This endpoint is only available for admins and advisors / هذه النقطة متاحة فقط للإداريين والمرشدين"
+        )
+    
+    try:
+        monitor = WellnessMonitor(db)
+        alerts = await monitor.get_wellness_alerts(alert_level=alert_level, limit=limit)
+        
+        return [
+            {
+                "id": alert.id,
+                "student_id": alert.student_id,
+                "alert_level": alert.alert_level,
+                "wellness_score": alert.wellness_score,
+                "indicators": alert.indicators,
+                "recommended_intervention": alert.recommended_intervention,
+                "created_at": alert.created_at.isoformat() if alert.created_at else None,
+                "updated_at": alert.updated_at.isoformat() if alert.updated_at else None,
+            }
+            for alert in alerts
+        ]
+        
+    except Exception as e:
+        logger.error(f"Error getting wellness alerts: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error retrieving wellness alerts / خطأ في استرجاع تنبيهات العافية: {str(e)}"
+        )
+
+@app.get("/wellness/students/{student_id}/history", response_model=List[Dict[str, Any]])
+async def get_student_wellness_history(
+    student_id: str,
+    limit: int = Query(30, ge=1, le=100, description="Maximum number of records / الحد الأقصى لعدد السجلات"),
+    current_user: Annotated[users_service.User, Depends(get_current_user)] = None,
+    db: Annotated[AsyncSession, Depends(get_users_session)] = None,
+):
+    """
+    Get student wellness history (student or advisor only)
+    / الحصول على تاريخ عافية الطالب (للطالب أو المرشد فقط)
+    
+    Args:
+        student_id: Student user ID / معرف الطالب
+        limit: Maximum number of records / الحد الأقصى لعدد السجلات
+        current_user: Authenticated user / المستخدم المصادق عليه
+        db: Database session / جلسة قاعدة البيانات
+    
+    Returns:
+        List of wellness history dictionaries / قائمة قواميس تاريخ العافية
+    """
+    # Authorization: student can only view their own history, advisor/admin can view any
+    if current_user.role == "student" and student_id != current_user.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only view your own wellness history / يمكنك فقط عرض تاريخ عافيتك الخاصة"
+        )
+    
+    if current_user.role not in ["student", "admin", "advisor"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This endpoint is only available for students, admins, and advisors"
+        )
+    
+    try:
+        monitor = WellnessMonitor(db)
+        history = await monitor.get_student_wellness_history(student_id, limit)
+        
+        return history
+        
+    except Exception as e:
+        logger.error(f"Error getting wellness history for {student_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error retrieving wellness history / خطأ في استرجاع تاريخ العافية: {str(e)}"
+        )
+
+# ------------------------------------------------------------
+# Learning Style Endpoints
+# مسارات أسلوب التعلم
+# ------------------------------------------------------------
+
+@app.get("/learning-style/students/{student_id}", response_model=Dict[str, Any])
+async def get_student_learning_style(
+    student_id: str,
+    use_ml: bool = Query(True, description="Use ML prediction / استخدام التنبؤ بـ ML"),
+    current_user: Annotated[users_service.User, Depends(get_current_user)] = None,
+    db: Annotated[AsyncSession, Depends(get_users_session)] = None,
+):
+    """
+    Get student learning style prediction (FSLSM)
+    / الحصول على تنبؤ أسلوب تعلم الطالب (FSLSM)
+    
+    Args:
+        student_id: Student user ID / معرف الطالب
+        use_ml: Whether to use ML prediction / ما إذا كان سيتم استخدام التنبؤ بـ ML
+        current_user: Authenticated user / المستخدم المصادق عليه
+        db: Database session / جلسة قاعدة البيانات
+    
+    Returns:
+        Dictionary with learning style prediction / قاموس يحتوي على تنبؤ أسلوب التعلم
+    """
+    # Authorization: student can only view their own style, advisor/admin can view any
+    if current_user.role == "student" and student_id != current_user.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only view your own learning style / يمكنك فقط عرض أسلوب تعلمك الخاص"
+        )
+    
+    if current_user.role not in ["student", "admin", "advisor"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This endpoint is only available for students, admins, and advisors"
+        )
+    
+    try:
+        service = LearningStyleService(db)
+        result = await service.predict_learning_style(student_id, use_ml_prediction=use_ml)
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error predicting learning style for {student_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error predicting learning style / خطأ في التنبؤ بأسلوب التعلم: {str(e)}"
+        )
+
+class LearningInteractionRequest(BaseModel):
+    """Request model for logging learning interaction / نموذج طلب تسجيل تفاعل التعلم"""
+    interaction_type: str = Field(..., description="Type of interaction / نوع التفاعل")
+    duration_seconds: Optional[int] = Field(None, description="Duration in seconds / المدة بالثواني")
+    content_type: Optional[str] = Field(None, description="Content type / نوع المحتوى")
+    course_code: Optional[str] = Field(None, description="Course code / رمز المقرر")
+    metadata: Optional[Dict[str, Any]] = Field(None, description="Additional metadata / بيانات وصفية إضافية")
+
+@app.post("/learning-style/interactions", response_model=Dict[str, Any])
+async def log_learning_interaction(
+    interaction: LearningInteractionRequest,
+    current_user: Annotated[users_service.User, Depends(get_current_user)] = None,
+    db: Annotated[AsyncSession, Depends(get_users_session)] = None,
+):
+    """
+    Log a learning interaction (for ML prediction)
+    / تسجيل تفاعل تعلم (للتنبؤ بـ ML)
+    
+    Args:
+        interaction: Interaction data / بيانات التفاعل
+        current_user: Authenticated user / المستخدم المصادق عليه
+        db: Database session / جلسة قاعدة البيانات
+    
+    Returns:
+        Dictionary with logged interaction / قاموس يحتوي على التفاعل المسجل
+    """
+    if current_user.role != "student":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This endpoint is only available for students / هذه النقطة متاحة فقط للطلاب"
+        )
+    
+    try:
+        service = LearningStyleService(db)
+        logged_interaction = await service.log_interaction(
+            student_id=current_user.user_id,
+            interaction_type=interaction.interaction_type,
+            duration_seconds=interaction.duration_seconds,
+            content_type=interaction.content_type,
+            course_code=interaction.course_code,
+            metadata=interaction.metadata
+        )
+        
+        return {
+            "id": logged_interaction.id,
+            "student_id": logged_interaction.student_id,
+            "interaction_type": logged_interaction.interaction_type,
+            "duration_seconds": logged_interaction.duration_seconds,
+            "content_type": logged_interaction.content_type,
+            "course_code": logged_interaction.course_code,
+            "timestamp": logged_interaction.timestamp.isoformat() if logged_interaction.timestamp else None
+        }
+        
+    except Exception as e:
+        logger.error(f"Error logging learning interaction: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error logging interaction / خطأ في تسجيل التفاعل: {str(e)}"
+        )
+
+# ------------------------------------------------------------
+# Peer Matching Endpoints
+# مسارات مطابقة الأقران
+# ------------------------------------------------------------
+
+@app.post("/peer-matching/find", response_model=List[Dict[str, Any]])
+async def find_study_partners(
+    student_id: str = Query(..., description="Student ID / معرف الطالب"),
+    course_code: Optional[str] = Query(None, description="Course code filter / مرشح رمز المقرر"),
+    match_type: str = Query("homogeneous", description="Match type: homogeneous or heterogeneous / نوع المطابقة"),
+    max_matches: int = Query(5, ge=1, le=20, description="Maximum matches / الحد الأقصى للمطابقات"),
+    current_user: Annotated[users_service.User, Depends(get_current_user)] = None,
+    db: Annotated[AsyncSession, Depends(get_users_session)] = None,
+):
+    """
+    Find study partners for a student
+    / العثور على شركاء دراسة لطالب
+    
+    Args:
+        student_id: Student user ID / معرف الطالب
+        course_code: Optional course code / رمز المقرر الاختياري
+        match_type: "homogeneous" or "heterogeneous" / "متشابه" أو "متكامل"
+        max_matches: Maximum number of matches / الحد الأقصى لعدد المطابقات
+        current_user: Authenticated user / المستخدم المصادق عليه
+        db: Database session / جلسة قاعدة البيانات
+    
+    Returns:
+        List of match dictionaries / قائمة قواميس المطابقات
+    """
+    # Authorization: student can only find partners for themselves
+    if current_user.role == "student" and student_id != current_user.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only find partners for yourself / يمكنك فقط العثور على شركاء لنفسك"
+        )
+    
+    if current_user.role not in ["student", "admin", "advisor"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This endpoint is only available for students, admins, and advisors"
+        )
+    
+    try:
+        service = PeerMatchingService(db)
+        matches = await service.find_study_partners(
+            student_id=student_id,
+            course_code=course_code,
+            match_type=match_type,
+            max_matches=max_matches
+        )
+        
+        return matches
+        
+    except Exception as e:
+        logger.error(f"Error finding study partners: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error finding partners / خطأ في العثور على الشركاء: {str(e)}"
+        )
+
+class StudyGroupRequest(BaseModel):
+    """Request model for creating study group / نموذج طلب إنشاء مجموعة دراسة"""
+    course_code: str = Field(..., description="Course code / رمز المقرر")
+    group_type: str = Field(..., description="homogeneous or heterogeneous / متشابه أو متكامل")
+    member_ids: List[str] = Field(..., description="List of student IDs / قائمة معرفات الطلاب")
+    max_size: int = Field(5, ge=2, le=10, description="Maximum group size / الحد الأقصى لحجم المجموعة")
+    description: Optional[str] = Field(None, description="Group description / وصف المجموعة")
+
+@app.post("/peer-matching/study-group", response_model=Dict[str, Any])
+async def create_study_group(
+    group_request: StudyGroupRequest,
+    current_user: Annotated[users_service.User, Depends(get_current_user)] = None,
+    db: Annotated[AsyncSession, Depends(get_users_session)] = None,
+):
+    """
+    Create a study group from matched students
+    / إنشاء مجموعة دراسة من الطلاب المطابقين
+    
+    Args:
+        group_request: Study group request / طلب مجموعة الدراسة
+        current_user: Authenticated user / المستخدم المصادق عليه
+        db: Database session / جلسة قاعدة البيانات
+    
+    Returns:
+        Dictionary with created study group / قاموس يحتوي على مجموعة الدراسة المنشأة
+    """
+    if current_user.role not in ["student", "admin", "advisor"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This endpoint is only available for students, admins, and advisors"
+        )
+    
+    try:
+        service = PeerMatchingService(db)
+        group = await service.create_study_group(
+            course_code=group_request.course_code,
+            group_type=group_request.group_type,
+            member_ids=group_request.member_ids,
+            max_size=group_request.max_size,
+            description=group_request.description
+        )
+        
+        return {
+            "id": group.id,
+            "course_code": group.course_code,
+            "group_type": group.group_type,
+            "max_size": group.max_size,
+            "current_size": group.current_size,
+            "members": group.members,
+            "description": group.description,
+            "created_at": group.created_at.isoformat() if group.created_at else None
+        }
+        
+    except Exception as e:
+        logger.error(f"Error creating study group: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error creating study group / خطأ في إنشاء مجموعة الدراسة: {str(e)}"
+        )
+
+@app.get("/peer-matching/students/{student_id}/matches", response_model=List[Dict[str, Any]])
+async def get_student_matches(
+    student_id: str,
+    status: Optional[str] = Query(None, description="Filter by status / التصفية حسب الحالة"),
+    current_user: Annotated[users_service.User, Depends(get_current_user)] = None,
+    db: Annotated[AsyncSession, Depends(get_users_session)] = None,
+):
+    """
+    Get all matches for a student
+    / الحصول على جميع المطابقات لطالب
+    
+    Args:
+        student_id: Student user ID / معرف الطالب
+        status: Optional status filter / مرشح الحالة الاختياري
+        current_user: Authenticated user / المستخدم المصادق عليه
+        db: Database session / جلسة قاعدة البيانات
+    
+    Returns:
+        List of match dictionaries / قائمة قواميس المطابقات
+    """
+    # Authorization: student can only view their own matches
+    if current_user.role == "student" and student_id != current_user.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only view your own matches / يمكنك فقط عرض مطابقاتك الخاصة"
+        )
+    
+    if current_user.role not in ["student", "admin", "advisor"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This endpoint is only available for students, admins, and advisors"
+        )
+    
+    try:
+        service = PeerMatchingService(db)
+        matches = await service.get_student_matches(student_id, status=status)
+        
+        return [
+            {
+                "id": match.id,
+                "student_1_id": match.student_1_id,
+                "student_2_id": match.student_2_id,
+                "match_type": match.match_type,
+                "compatibility_score": match.compatibility_score,
+                "match_reason": match.match_reason,
+                "course_code": match.course_code,
+                "status": match.status,
+                "created_at": match.created_at.isoformat() if match.created_at else None
+            }
+            for match in matches
+        ]
+        
+    except Exception as e:
+        logger.error(f"Error getting matches for {student_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error retrieving matches / خطأ في استرجاع المطابقات: {str(e)}"
+        )
+
+# ------------------------------------------------------------
+# Bulk Import Endpoints
+# مسارات الاستيراد بالجملة
+# ------------------------------------------------------------
+
+class BulkImportRequest(BaseModel):
+    """Request model for bulk CSV import / نموذج طلب استيراد CSV بالجملة"""
+    csv_folder_path: str = Field(..., description="Path to CSV folder / مسار مجلد CSV")
+    batch_size: int = Field(100, ge=1, le=500, description="Batch size / حجم الدفعة")
+
+@app.post("/admin/students/bulk-import", response_model=Dict[str, Any])
+async def bulk_import_students(
+    import_request: BulkImportRequest,
+    current_admin: Annotated[users_service.User, Depends(get_current_admin_user)] = None,
+    db: Annotated[AsyncSession, Depends(get_users_session)] = None,
+):
+    """
+    Bulk import students from CSV folder (admin only)
+    / استيراد الطلاب بالجملة من مجلد CSV (للإداريين فقط)
+    
+    Args:
+        import_request: Bulk import request / طلب الاستيراد بالجملة
+        current_admin: Authenticated admin user / المستخدم الإداري المصادق عليه
+        db: Database session / جلسة قاعدة البيانات
+    
+    Returns:
+        Dictionary with import results / قاموس يحتوي على نتائج الاستيراد
+    """
+    if current_admin.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This endpoint is only available for admins / هذه النقطة متاحة فقط للإداريين"
+        )
+    
+    try:
+        importer = BulkCSVImporter(db)
+        result = await importer.import_students_bulk(
+            csv_folder_path=import_request.csv_folder_path,
+            batch_size=import_request.batch_size
+        )
+        
+        logger.info(f"Bulk import completed: {result['imported']} imported, {result['failed']} failed")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error in bulk import: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error during bulk import / خطأ أثناء الاستيراد بالجملة: {str(e)}"
+        )
