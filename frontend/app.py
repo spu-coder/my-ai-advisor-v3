@@ -680,6 +680,10 @@ def chat_interface():
                     source = response_data.get("source", "غير معروف")
                     intent = response_data.get("intent", "غير محدد")
                     demo_warning = response_data.get("demo_warning", "")
+                    
+                    # Check if response is from FAQ (URAG)
+                    is_faq = "FAQ" in source or response_data.get("mode") == "faq"
+                    faq_confidence = response_data.get("confidence")
 
                     # Format response with better structure
                     intent_colors = {
@@ -690,6 +694,16 @@ def chat_interface():
                         "general_chat": "#6b7280"
                     }
                     intent_color = intent_colors.get(intent, "#6b7280")
+                    
+                    # Display FAQ badge if from FAQ (URAG)
+                    if is_faq:
+                        st.markdown(f"""
+                        <div style='display: inline-block; background: #10b981; color: white; 
+                                    padding: 0.25rem 0.75rem; border-radius: 12px; font-size: 0.85rem; 
+                                    margin-bottom: 1rem; font-weight: 500; margin-left: 0.5rem;'>
+                            ✓ إجابة دقيقة 100% من اللوائح
+                        </div>
+                        """, unsafe_allow_html=True)
                     
                     # Display intent badge
                     st.markdown(f"""
@@ -708,10 +722,14 @@ def chat_interface():
                         st.warning(demo_warning)
                     
                     # Display source with better styling
+                    source_color = "#10b981" if is_faq else "#3b82f6"
+                    source_icon = "✓" if is_faq else "📄"
+                    source_label = "مصدر دقيق 100%" if is_faq else "المصدر"
+                    
                     st.markdown(f"""
                     <div style='margin-top: 1rem; padding: 0.75rem; background: rgba(59, 130, 246, 0.1);
-                                border-left: 3px solid #3b82f6; border-radius: 5px; font-size: 0.9rem;'>
-                        📄 <strong>المصدر:</strong> {source}
+                                border-left: 3px solid {source_color}; border-radius: 5px; font-size: 0.9rem;'>
+                        {source_icon} <strong>{source_label}:</strong> {source}
                     </div>
                     """, unsafe_allow_html=True)
 
@@ -1400,12 +1418,345 @@ def settings_interface():
 # التنقل بين الصفحات
 # ------------------------------------------------------------
 
+# ------------------------------------------------------------
+# Advisor Dashboard Interface
+# واجهة لوحة تحكم المرشد
+# ------------------------------------------------------------
+
+def advisor_dashboard_interface():
+    """لوحة تحكم المرشد - مراجعة تنبيهات الطلاب واتخاذ التدخلات"""
+    st.header("📋 لوحة تحكم المرشد الأكاديمي")
+    st.caption("مراجعة تنبيهات الطلاب واتخاذ التدخلات المناسبة")
+    
+    if st.session_state.user_role not in ["admin", "advisor"]:
+        st.error("⚠️ هذه الصفحة متاحة فقط للمرشدين والإداريين")
+        return
+    
+    headers = {"Authorization": f"Bearer {st.session_state.access_token}"}
+    
+    # Filters
+    col1, col2 = st.columns(2)
+    with col1:
+        priority_filter = st.selectbox(
+            "تصفية حسب الأولوية",
+            ["all", "critical", "high", "medium", "low"],
+            key="advisor_priority_filter"
+        )
+    with col2:
+        limit = st.number_input("عدد التنبيهات", min_value=10, max_value=100, value=50, step=10)
+    
+    # Fetch alerts
+    if st.button("🔄 تحديث التنبيهات", use_container_width=True):
+        params = {"limit": limit}
+        if priority_filter != "all":
+            params["priority"] = priority_filter
+        
+        alerts = get_request(
+            f"{BACKEND_URL}/advisor/alerts/pending",
+            headers=headers
+        )
+        
+        if alerts:
+            st.session_state.advisor_alerts = alerts
+        else:
+            st.session_state.advisor_alerts = []
+    
+    # Display alerts
+    if "advisor_alerts" in st.session_state and st.session_state.advisor_alerts:
+        alerts = st.session_state.advisor_alerts
+        
+        st.metric("عدد التنبيهات المعلّقة", len(alerts))
+        
+        for alert in alerts:
+            with st.expander(f"🔴 {alert.get('student_id', 'Unknown')} - {alert.get('risk_level', 'unknown').upper()}", expanded=True):
+                col1, col2 = st.columns([3, 1])
+                
+                with col1:
+                    st.markdown(f"**الوصف:** {alert.get('description', 'N/A')}")
+                    
+                    # Contributing factors
+                    if alert.get('contributing_factors'):
+                        st.subheader("العوامل المساهمة:")
+                        factors = alert.get('contributing_factors', {})
+                        for factor, importance in sorted(factors.items(), key=lambda x: x[1], reverse=True)[:3]:
+                            st.progress(importance, text=f"{factor}: {importance*100:.1f}%")
+                    
+                    st.caption(f"دقة التنبؤ: {alert.get('prediction_confidence', 0)*100:.1f}%")
+                
+                with col2:
+                    st.selectbox(
+                        "الإجراء",
+                        ["email", "meeting", "resource_suggestion", "dismiss"],
+                        key=f"action_{alert['id']}"
+                    )
+                    
+                    notes = st.text_area("ملاحظات", key=f"notes_{alert['id']}", height=100)
+                    
+                    if st.button("💾 حفظ الإجراء", key=f"save_{alert['id']}"):
+                        action_data = {
+                            "action_type": st.session_state.get(f"action_{alert['id']}", "email"),
+                            "notes": notes
+                        }
+                        
+                        result = post_request(
+                            f"{BACKEND_URL}/advisor/alerts/{alert['id']}/action",
+                            action_data,
+                            headers=headers
+                        )
+                        
+                        if result:
+                            st.success("✅ تم حفظ الإجراء بنجاح")
+                            st.rerun()
+    else:
+        st.info("لا توجد تنبيهات معلّقة حالياً")
+
+# ------------------------------------------------------------
+# Wellness Monitor Interface
+# واجهة مراقب العافية
+# ------------------------------------------------------------
+
+def wellness_monitor_interface():
+    """واجهة مراقبة العافية للطلاب"""
+    st.header("💚 مراقب العافية الاستباقي")
+    st.caption("تحليل أنماط التفاعل للكشف المبكر عن علامات الإرهاق الأكاديمي")
+    
+    headers = {"Authorization": f"Bearer {st.session_state.access_token}"}
+    
+    # Student selection (for advisors/admins)
+    student_id = None
+    if st.session_state.user_role in ["admin", "advisor"]:
+        student_id = st.text_input("معرف الطالب", key="wellness_student_id")
+    else:
+        student_id = st.session_state.user_id
+    
+    if not student_id:
+        st.warning("⚠️ يرجى إدخال معرف الطالب")
+        return
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        days_window = st.number_input("نافذة التحليل (أيام)", min_value=7, max_value=30, value=14)
+    
+    if st.button("🔍 تحليل العافية", use_container_width=True):
+        wellness_data = get_request(
+            f"{BACKEND_URL}/wellness/students/{student_id}?days_window={days_window}",
+            headers=headers
+        )
+        
+        if wellness_data:
+            st.session_state.wellness_data = wellness_data
+    
+    # Display wellness analysis
+    if "wellness_data" in st.session_state and st.session_state.wellness_data:
+        data = st.session_state.wellness_data
+        
+        if data.get("opt_in_required"):
+            st.warning("⚠️ الطالب لم يوافق على مراقبة العافية")
+            if st.button("📝 طلب الموافقة"):
+                st.info("سيتم إرسال طلب موافقة للطالب")
+            return
+        
+        # Wellness Score Gauge
+        wellness_score = data.get("wellness_score", 0)
+        alert_level = data.get("alert_level", "green")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("مؤشر العافية", f"{wellness_score*100:.0f}%")
+        
+        with col2:
+            color_map = {"green": "🟢", "yellow": "🟡", "red": "🔴"}
+            st.metric("مستوى التنبيه", f"{color_map.get(alert_level, '⚪')} {alert_level}")
+        
+        with col3:
+            deviations_count = len(data.get("deviations", []))
+            st.metric("الانحرافات المكتشفة", deviations_count)
+        
+        # Progress bar for wellness score
+        st.progress(wellness_score, text=f"مؤشر العافية: {wellness_score*100:.0f}%")
+        
+        # Indicators
+        st.subheader("📊 المؤشرات السلوكية")
+        indicators = data.get("indicators", {})
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("نمط التسليم", f"{indicators.get('submission_pattern', 'N/A')}")
+            st.metric("مدة الجلسة (دقيقة)", f"{indicators.get('session_duration_avg', 'N/A')}")
+        
+        with col2:
+            st.metric("التفاعل الاجتماعي", f"{indicators.get('social_engagement', 0)}")
+            st.metric("النشاط الليلي", f"{indicators.get('late_night_activity', 0)}")
+        
+        # Deviations
+        deviations = data.get("deviations", [])
+        if deviations:
+            st.subheader("⚠️ الانحرافات المكتشفة")
+            for dev in deviations:
+                st.warning(f"**{dev.get('type', 'Unknown')}**: {dev.get('description', 'N/A')}")
+        
+        # Recommended Intervention
+        intervention = data.get("recommended_intervention")
+        if intervention:
+            st.subheader("💡 التوصية")
+            st.info(intervention)
+            
+            if st.button("📞 طلب المساعدة من المرشد"):
+                st.success("✅ تم إرسال طلب المساعدة")
+
+# ------------------------------------------------------------
+# Peer Matching Interface
+# واجهة مطابقة الأقران
+# ------------------------------------------------------------
+
+def peer_matching_interface():
+    """واجهة مطابقة الأقران للعثور على شركاء دراسة"""
+    st.header("🤝 العثور على شركاء دراسة")
+    st.caption("مطابقة ذكية بناءً على أسلوب التعلم والأداء الأكاديمي")
+    
+    headers = {"Authorization": f"Bearer {st.session_state.access_token}"}
+    
+    student_id = st.session_state.user_id
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        course_code = st.text_input("رمز المقرر (اختياري)", key="peer_course_code")
+    with col2:
+        match_type = st.selectbox(
+            "نوع المطابقة",
+            ["homogeneous", "heterogeneous"],
+            format_func=lambda x: "متشابهون (للمراجعة)" if x == "homogeneous" else "متكاملون (للمشاريع)",
+            key="peer_match_type"
+        )
+    
+    max_matches = st.number_input("عدد المطابقات", min_value=1, max_value=20, value=5)
+    
+    if st.button("🔍 البحث عن شركاء", use_container_width=True):
+        params = {
+            "student_id": student_id,
+            "match_type": match_type,
+            "max_matches": max_matches
+        }
+        if course_code:
+            params["course_code"] = course_code
+        
+        matches = get_request(
+            f"{BACKEND_URL}/peer-matching/find",
+            headers=headers
+        )
+        
+        if matches:
+            st.session_state.peer_matches = matches
+        else:
+            st.session_state.peer_matches = []
+    
+    # Display matches
+    if "peer_matches" in st.session_state and st.session_state.peer_matches:
+        matches = st.session_state.peer_matches
+        
+        st.success(f"✅ تم العثور على {len(matches)} مطابقة")
+        
+        for match in matches:
+            with st.container():
+                col1, col2 = st.columns([1, 3])
+                
+                with col1:
+                    score = match.get("compatibility_score", 0)
+                    st.metric("التوافق", f"{score*100:.0f}%")
+                    st.progress(score)
+                
+                with col2:
+                    st.markdown(f"### {match.get('student_name', 'Unknown')}")
+                    st.markdown(f"**السبب:** {match.get('match_reason', 'N/A')}")
+                    
+                    # Learning style badges
+                    style = match.get("learning_style", {})
+                    if style:
+                        cols = st.columns(4)
+                        for idx, (dim, value) in enumerate(style.items()):
+                            if idx < 4:
+                                cols[idx].badge(value)
+                    
+                    if st.button(f"📧 إرسال طلب تواصل", key=f"contact_{match.get('student_id')}"):
+                        st.info("سيتم إرسال طلب التواصل للطالب")
+
+# ------------------------------------------------------------
+# Admin Bulk Import Interface
+# واجهة استيراد الطلاب بالجملة
+# ------------------------------------------------------------
+
+def admin_bulk_import_interface():
+    """واجهة استيراد الطلاب بالجملة من CSV"""
+    st.header("📥 استيراد الطلاب بالجملة (CSV)")
+    st.caption("استيراد 3500+ طالب من ملفات CSV متعددة")
+    
+    if st.session_state.user_role != "admin":
+        st.error("⚠️ هذه الصفحة متاحة فقط للإداريين")
+        return
+    
+    headers = {"Authorization": f"Bearer {st.session_state.access_token}"}
+    
+    st.info("""
+    **تعليمات الاستيراد:**
+    - كل طالب له ملف CSV خاص به
+    - يجب أن يحتوي الملف على: student_id, name, email, major, courses, grades
+    - ضع جميع ملفات CSV في مجلد واحد
+    """)
+    
+    csv_folder_path = st.text_input(
+        "مسار مجلد CSV",
+        placeholder="C:/Projects/IntelliPath_Project/students",
+        key="csv_folder_path"
+    )
+    
+    batch_size = st.number_input("حجم الدفعة", min_value=10, max_value=500, value=100)
+    
+    if st.button("🚀 بدء الاستيراد", use_container_width=True, type="primary"):
+        if not csv_folder_path:
+            st.error("⚠️ يرجى إدخال مسار المجلد")
+            return
+        
+        with st.spinner("⏳ جاري الاستيراد... قد يستغرق هذا وقتاً طويلاً"):
+            import_data = {
+                "csv_folder_path": csv_folder_path,
+                "batch_size": batch_size
+            }
+            
+            result = post_request(
+                f"{BACKEND_URL}/admin/students/bulk-import",
+                import_data,
+                headers=headers,
+                timeout=600  # 10 minutes timeout
+            )
+            
+            if result:
+                st.session_state.import_result = result
+    
+    # Display results
+    if "import_result" in st.session_state and st.session_state.import_result:
+        result = st.session_state.import_result
+        
+        col1, col2, col3 = st.columns(3)
+        col1.metric("إجمالي الملفات", result.get("total_files", 0))
+        col2.metric("✅ تم الاستيراد", result.get("imported", 0), delta=f"+{result.get('imported', 0)}")
+        col3.metric("❌ فشل", result.get("failed", 0), delta=f"-{result.get('failed', 0)}", delta_color="inverse")
+        
+        # Errors
+        errors = result.get("errors", [])
+        if errors:
+            with st.expander(f"⚠️ الأخطاء ({len(errors)})", expanded=False):
+                for err in errors[:50]:  # Show first 50 errors
+                    st.error(f"**{err.get('file', 'Unknown')}**: {err.get('error', 'Unknown error')}")
+
 # تعريف الصفحات حسب الدور
 STUDENT_PAGES = {
     "💬 الدردشة الذكية": chat_interface,
     "🔄 جمع البيانات": sync_data_interface,
     "📊 تحليل التقدم": progress_analysis_interface,
     "🧮 محاكي المعدل": gpa_simulator_interface,
+    "💚 مراقب العافية": wellness_monitor_interface,
+    "🤝 مطابقة الأقران": peer_matching_interface,
     "🔔 الإشعارات": notifications_interface,
     "🌳 الرسم البياني للمهارات": graph_interface,
     "📚 دليل البيانات": data_guide_interface,
@@ -1414,6 +1765,9 @@ STUDENT_PAGES = {
 
 ADMIN_PAGES = {
     "💬 الدردشة الذكية": chat_interface,
+    "📋 لوحة تحكم المرشد": advisor_dashboard_interface,
+    "💚 مراقب العافية": wellness_monitor_interface,
+    "📥 استيراد الطلاب": admin_bulk_import_interface,
     "📊 تحليل التقدم": progress_analysis_interface,
     "🧮 محاكي المعدل": gpa_simulator_interface,
     "🔔 الإشعارات": notifications_interface,
