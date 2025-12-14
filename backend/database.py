@@ -316,6 +316,49 @@ class LearningInteraction(Base):
     # Relationship
     student = relationship("User", foreign_keys=[student_id], backref="learning_interactions")
 
+class PeerMatch(Base):
+    """
+    Peer Match Model - AI-driven peer matching
+    نموذج مطابقة الأقران - مطابقة الأقران المدفوعة بالذكاء الاصطناعي
+    
+    Stores matches between students for study groups and projects
+    يخزن المطابقات بين الطلاب لمجموعات الدراسة والمشاريع
+    """
+    __tablename__ = "peer_matches"
+    id = Column(Integer, primary_key=True, index=True)
+    student_1_id = Column(String, ForeignKey("users.user_id"), nullable=False, index=True)
+    student_2_id = Column(String, ForeignKey("users.user_id"), nullable=False, index=True)
+    match_type = Column(String, nullable=False, index=True)  # study_group, project_team, tutoring
+    compatibility_score = Column(Float, nullable=False)  # 0-1 compatibility score
+    match_reason = Column(Text, nullable=True)  # Human-readable explanation
+    course_code = Column(String, nullable=True, index=True)  # Related course (if applicable)
+    status = Column(String, default="suggested", index=True)  # suggested, accepted, declined, completed
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    student_1 = relationship("User", foreign_keys=[student_1_id], backref="peer_matches_as_student_1")
+    student_2 = relationship("User", foreign_keys=[student_2_id], backref="peer_matches_as_student_2")
+
+class StudyGroup(Base):
+    """
+    Study Group Model - Organized study groups
+    نموذج مجموعة الدراسة - مجموعات الدراسة المنظمة
+    
+    Stores study groups created from peer matches
+    يخزن مجموعات الدراسة المنشأة من مطابقات الأقران
+    """
+    __tablename__ = "study_groups"
+    id = Column(Integer, primary_key=True, index=True)
+    course_code = Column(String, nullable=True, index=True)  # Related course
+    group_type = Column(String, nullable=False)  # homogeneous, heterogeneous
+    max_size = Column(Integer, default=5)  # Maximum group size
+    current_size = Column(Integer, default=0)  # Current number of members
+    members = Column(JSON, nullable=False)  # [{student_id, role, joined_at}, ...]
+    description = Column(Text, nullable=True)  # Group description
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
 # ------------------------------------------------------------
 # Async Session Management
 # ------------------------------------------------------------

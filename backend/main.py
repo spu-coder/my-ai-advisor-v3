@@ -34,6 +34,8 @@ from services.faq_service import FAQService
 from services.advisor_alert_service import AdvisorAlertService
 from services.wellness_monitor import WellnessMonitor
 from services.learning_style_service import LearningStyleService
+from services.peer_matching_service import PeerMatchingService
+from services.bulk_csv_importer import BulkCSVImporter
 
 # ------------------------------------------------------------
 # إعداد التسجيل (Logging)
@@ -1361,4 +1363,235 @@ async def log_learning_interaction(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error logging interaction / خطأ في تسجيل التفاعل: {str(e)}"
+        )
+
+# ------------------------------------------------------------
+# Peer Matching Endpoints
+# مسارات مطابقة الأقران
+# ------------------------------------------------------------
+
+@app.post("/peer-matching/find", response_model=List[Dict[str, Any]])
+async def find_study_partners(
+    student_id: str = Query(..., description="Student ID / معرف الطالب"),
+    course_code: Optional[str] = Query(None, description="Course code filter / مرشح رمز المقرر"),
+    match_type: str = Query("homogeneous", description="Match type: homogeneous or heterogeneous / نوع المطابقة"),
+    max_matches: int = Query(5, ge=1, le=20, description="Maximum matches / الحد الأقصى للمطابقات"),
+    current_user: Annotated[users_service.User, Depends(get_current_user)] = None,
+    db: Annotated[AsyncSession, Depends(get_users_session)] = None,
+):
+    """
+    Find study partners for a student
+    / العثور على شركاء دراسة لطالب
+    
+    Args:
+        student_id: Student user ID / معرف الطالب
+        course_code: Optional course code / رمز المقرر الاختياري
+        match_type: "homogeneous" or "heterogeneous" / "متشابه" أو "متكامل"
+        max_matches: Maximum number of matches / الحد الأقصى لعدد المطابقات
+        current_user: Authenticated user / المستخدم المصادق عليه
+        db: Database session / جلسة قاعدة البيانات
+    
+    Returns:
+        List of match dictionaries / قائمة قواميس المطابقات
+    """
+    # Authorization: student can only find partners for themselves
+    if current_user.role == "student" and student_id != current_user.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only find partners for yourself / يمكنك فقط العثور على شركاء لنفسك"
+        )
+    
+    if current_user.role not in ["student", "admin", "advisor"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This endpoint is only available for students, admins, and advisors"
+        )
+    
+    try:
+        service = PeerMatchingService(db)
+        matches = await service.find_study_partners(
+            student_id=student_id,
+            course_code=course_code,
+            match_type=match_type,
+            max_matches=max_matches
+        )
+        
+        return matches
+        
+    except Exception as e:
+        logger.error(f"Error finding study partners: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error finding partners / خطأ في العثور على الشركاء: {str(e)}"
+        )
+
+class StudyGroupRequest(BaseModel):
+    """Request model for creating study group / نموذج طلب إنشاء مجموعة دراسة"""
+    course_code: str = Field(..., description="Course code / رمز المقرر")
+    group_type: str = Field(..., description="homogeneous or heterogeneous / متشابه أو متكامل")
+    member_ids: List[str] = Field(..., description="List of student IDs / قائمة معرفات الطلاب")
+    max_size: int = Field(5, ge=2, le=10, description="Maximum group size / الحد الأقصى لحجم المجموعة")
+    description: Optional[str] = Field(None, description="Group description / وصف المجموعة")
+
+@app.post("/peer-matching/study-group", response_model=Dict[str, Any])
+async def create_study_group(
+    group_request: StudyGroupRequest,
+    current_user: Annotated[users_service.User, Depends(get_current_user)] = None,
+    db: Annotated[AsyncSession, Depends(get_users_session)] = None,
+):
+    """
+    Create a study group from matched students
+    / إنشاء مجموعة دراسة من الطلاب المطابقين
+    
+    Args:
+        group_request: Study group request / طلب مجموعة الدراسة
+        current_user: Authenticated user / المستخدم المصادق عليه
+        db: Database session / جلسة قاعدة البيانات
+    
+    Returns:
+        Dictionary with created study group / قاموس يحتوي على مجموعة الدراسة المنشأة
+    """
+    if current_user.role not in ["student", "admin", "advisor"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This endpoint is only available for students, admins, and advisors"
+        )
+    
+    try:
+        service = PeerMatchingService(db)
+        group = await service.create_study_group(
+            course_code=group_request.course_code,
+            group_type=group_request.group_type,
+            member_ids=group_request.member_ids,
+            max_size=group_request.max_size,
+            description=group_request.description
+        )
+        
+        return {
+            "id": group.id,
+            "course_code": group.course_code,
+            "group_type": group.group_type,
+            "max_size": group.max_size,
+            "current_size": group.current_size,
+            "members": group.members,
+            "description": group.description,
+            "created_at": group.created_at.isoformat() if group.created_at else None
+        }
+        
+    except Exception as e:
+        logger.error(f"Error creating study group: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error creating study group / خطأ في إنشاء مجموعة الدراسة: {str(e)}"
+        )
+
+@app.get("/peer-matching/students/{student_id}/matches", response_model=List[Dict[str, Any]])
+async def get_student_matches(
+    student_id: str,
+    status: Optional[str] = Query(None, description="Filter by status / التصفية حسب الحالة"),
+    current_user: Annotated[users_service.User, Depends(get_current_user)] = None,
+    db: Annotated[AsyncSession, Depends(get_users_session)] = None,
+):
+    """
+    Get all matches for a student
+    / الحصول على جميع المطابقات لطالب
+    
+    Args:
+        student_id: Student user ID / معرف الطالب
+        status: Optional status filter / مرشح الحالة الاختياري
+        current_user: Authenticated user / المستخدم المصادق عليه
+        db: Database session / جلسة قاعدة البيانات
+    
+    Returns:
+        List of match dictionaries / قائمة قواميس المطابقات
+    """
+    # Authorization: student can only view their own matches
+    if current_user.role == "student" and student_id != current_user.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only view your own matches / يمكنك فقط عرض مطابقاتك الخاصة"
+        )
+    
+    if current_user.role not in ["student", "admin", "advisor"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This endpoint is only available for students, admins, and advisors"
+        )
+    
+    try:
+        service = PeerMatchingService(db)
+        matches = await service.get_student_matches(student_id, status=status)
+        
+        return [
+            {
+                "id": match.id,
+                "student_1_id": match.student_1_id,
+                "student_2_id": match.student_2_id,
+                "match_type": match.match_type,
+                "compatibility_score": match.compatibility_score,
+                "match_reason": match.match_reason,
+                "course_code": match.course_code,
+                "status": match.status,
+                "created_at": match.created_at.isoformat() if match.created_at else None
+            }
+            for match in matches
+        ]
+        
+    except Exception as e:
+        logger.error(f"Error getting matches for {student_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error retrieving matches / خطأ في استرجاع المطابقات: {str(e)}"
+        )
+
+# ------------------------------------------------------------
+# Bulk Import Endpoints
+# مسارات الاستيراد بالجملة
+# ------------------------------------------------------------
+
+class BulkImportRequest(BaseModel):
+    """Request model for bulk CSV import / نموذج طلب استيراد CSV بالجملة"""
+    csv_folder_path: str = Field(..., description="Path to CSV folder / مسار مجلد CSV")
+    batch_size: int = Field(100, ge=1, le=500, description="Batch size / حجم الدفعة")
+
+@app.post("/admin/students/bulk-import", response_model=Dict[str, Any])
+async def bulk_import_students(
+    import_request: BulkImportRequest,
+    current_admin: Annotated[users_service.User, Depends(get_current_admin_user)] = None,
+    db: Annotated[AsyncSession, Depends(get_users_session)] = None,
+):
+    """
+    Bulk import students from CSV folder (admin only)
+    / استيراد الطلاب بالجملة من مجلد CSV (للإداريين فقط)
+    
+    Args:
+        import_request: Bulk import request / طلب الاستيراد بالجملة
+        current_admin: Authenticated admin user / المستخدم الإداري المصادق عليه
+        db: Database session / جلسة قاعدة البيانات
+    
+    Returns:
+        Dictionary with import results / قاموس يحتوي على نتائج الاستيراد
+    """
+    if current_admin.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This endpoint is only available for admins / هذه النقطة متاحة فقط للإداريين"
+        )
+    
+    try:
+        importer = BulkCSVImporter(db)
+        result = await importer.import_students_bulk(
+            csv_folder_path=import_request.csv_folder_path,
+            batch_size=import_request.batch_size
+        )
+        
+        logger.info(f"Bulk import completed: {result['imported']} imported, {result['failed']} failed")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error in bulk import: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error during bulk import / خطأ أثناء الاستيراد بالجملة: {str(e)}"
         )

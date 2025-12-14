@@ -21,7 +21,9 @@ import hashlib
 import sys
 import logging
 import chromadb
-from typing import Dict, Any, Optional
+import re
+from typing import Dict, Any, Optional, List
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -149,6 +151,10 @@ def ingest_documents() -> Dict[str, Any]:
         logger.info("Splitting documents into chunks...")
         split_docs = []
         for doc in loaded_docs:
+            # Enrich metadata before splitting
+            enriched_metadata = _enrich_metadata(doc.page_content, doc.metadata)
+            doc.metadata = enriched_metadata
+            
             chunks = parent_splitter.split_documents([doc])
             split_docs.extend(chunks)
         
@@ -324,3 +330,273 @@ def retrieve_context(question: str) -> tuple[Optional[str], str]:
 def get_rag_retriever():
     """إرجاع كائن RAG Retriever للاستخدام المباشر في Agent."""
     return retriever
+
+# ------------------------------------------------------------
+# Context-Aware Metadata Enhancement Functions
+# دوال تحسين البيانات الوصفية الموجهة بالسياق
+# ------------------------------------------------------------
+
+def _enrich_metadata(content: str, original_metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Enrich metadata with comprehensive fields for context-aware filtering
+    
+    إثراء البيانات الوصفية بحقول شاملة للتصفية الموجهة بالسياق
+    
+    Args:
+        content: Document content / محتوى المستند
+        original_metadata: Original metadata dictionary / قاموس البيانات الوصفية الأصلي
+    
+    Returns:
+        Enriched metadata dictionary / قاموس البيانات الوصفية المثراة
+    """
+    enriched = {
+        **original_metadata,
+        
+        # Versioning (حسب الرؤية الأصلية)
+        "plan_version": _extract_plan_version(content),
+        "applies_to_cohorts": _extract_cohorts(content),
+        "status": "active",  # active, deprecated, archived
+        
+        # Document classification
+        "doc_category": _classify_document(content, original_metadata.get("source", "")),
+        
+        # Timestamp
+        "created_at": datetime.utcnow().isoformat(),
+        
+        # Quality score (simplified)
+        "quality_score": _calculate_quality_score(content),
+    }
+    
+    return enriched
+
+def _extract_plan_version(content: str) -> str:
+    """
+    Extract plan version from content
+    
+    استخراج إصدار الخطة من المحتوى
+    
+    Args:
+        content: Document content / محتوى المستند
+    
+    Returns:
+        Plan version year (e.g., "2024") or "unknown" / سنة إصدار الخطة أو "unknown"
+    """
+    # Look for "خطة 2024" or "Plan 2024" or "2024 plan"
+    patterns = [
+        r'(?:خطة|plan|الخطة)\s*(\d{4})',
+        r'(\d{4})\s*(?:plan|خطة)',
+        r'خطة\s*الدراسية\s*(\d{4})',
+        r'الخطة\s*الدراسية\s*(\d{4})',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, content, re.IGNORECASE)
+        if match:
+            year = match.group(1)
+            # Validate year (reasonable range)
+            if 2015 <= int(year) <= 2030:
+                return year
+    
+    return "unknown"
+
+def _extract_cohorts(content: str) -> List[str]:
+    """
+    Extract applicable cohorts from content
+    
+    استخراج الأفواج المنطبقة من المحتوى
+    
+    Args:
+        content: Document content / محتوى المستند
+    
+    Returns:
+        List of cohort identifiers / قائمة معرفات الأفواج
+    """
+    cohorts = []
+    
+    # Look for cohort patterns like "2018-2021", "2022+", "cohort 2022"
+    patterns = [
+        r'(\d{4})\s*[-–]\s*(\d{4})',  # 2018-2021
+        r'(\d{4})\+',  # 2022+
+        r'cohort\s*(\d{4})',
+        r'دفعة\s*(\d{4})',
+    ]
+    
+    for pattern in patterns:
+        matches = re.findall(pattern, content, re.IGNORECASE)
+        for match in matches:
+            if isinstance(match, tuple):
+                if len(match) == 2:
+                    cohorts.append(f"{match[0]}-{match[1]}")
+                else:
+                    cohorts.append(match[0])
+            else:
+                cohorts.append(match)
+    
+    # If no specific cohorts found, try to infer from plan version
+    plan_version = _extract_plan_version(content)
+    if plan_version != "unknown":
+        # Assume applies to students enrolled in that year and later
+        cohorts.append(f"{plan_version}+")
+    
+    return list(set(cohorts)) if cohorts else ["all"]
+
+def _classify_document(content: str, source: str) -> str:
+    """
+    Classify document type
+    
+    تصنيف نوع المستند
+    
+    Args:
+        content: Document content / محتوى المستند
+        source: Source file path / مسار الملف المصدر
+    
+    Returns:
+        Document category / فئة المستند
+    """
+    content_lower = content.lower()
+    source_lower = source.lower()
+    
+    # Classification keywords
+    categories = {
+        "regulation": ["لائحة", "قرار", "regulation", "policy", "قواعد", "نظام"],
+        "syllabus": ["مقرر", "syllabus", "course", "وصف المقرر", "course description"],
+        "handbook": ["دليل", "handbook", "guide", "manual", "كتيب"],
+        "calendar": ["تقويم", "calendar", "جدول", "schedule", "مواعيد"],
+        "exam": ["امتحان", "exam", "اختبار", "test", "examination"],
+        "announcement": ["إعلان", "announcement", "notice", "تنبيه"],
+    }
+    
+    # Check content
+    for category, keywords in categories.items():
+        if any(keyword in content_lower for keyword in keywords):
+            return category
+    
+    # Check source filename
+    for category, keywords in categories.items():
+        if any(keyword in source_lower for keyword in keywords):
+            return category
+    
+    return "general"
+
+def _calculate_quality_score(content: str) -> float:
+    """
+    Calculate document quality score (0-1)
+    
+    حساب درجة جودة المستند (0-1)
+    
+    Args:
+        content: Document content / محتوى المستند
+    
+    Returns:
+        Quality score between 0 and 1 / درجة الجودة بين 0 و 1
+    """
+    if not content or len(content.strip()) == 0:
+        return 0.0
+    
+    score = 1.0
+    
+    # Penalize very short documents
+    if len(content) < 100:
+        score -= 0.3
+    
+    # Penalize very long documents (might be noise)
+    if len(content) > 100000:
+        score -= 0.2
+    
+    # Check for structure (headers, lists, etc.)
+    has_structure = bool(
+        re.search(r'#+\s+\w+|^\d+\.|^[•\-\*]', content, re.MULTILINE)
+    )
+    if not has_structure:
+        score -= 0.1
+    
+    # Check for Arabic/English content (both is good)
+    has_arabic = bool(re.search(r'[\u0600-\u06FF]', content))
+    has_english = bool(re.search(r'[a-zA-Z]', content))
+    
+    if has_arabic and has_english:
+        score += 0.1  # Bonus for bilingual
+    
+    return max(0.0, min(1.0, score))
+
+def retrieve_context_with_filter(
+    question: str,
+    student_context: Optional[Dict[str, Any]] = None
+) -> tuple[Optional[str], str]:
+    """
+    Retrieve context with context-aware filtering
+    
+    استرجاع السياق مع التصفية الموجهة بالسياق
+    
+    Args:
+        question: User's question / سؤال المستخدم
+        student_context: Student context for filtering / سياق الطالب للتصفية
+            {
+                "major": "Software Engineering",
+                "enrollment_year": 2022,
+                "current_year": 3,
+                "plan_version": "2022"
+            }
+    
+    Returns:
+        Tuple of (context_string, source_info) / مجموعة من (سلسلة_السياق، معلومات_المصدر)
+    """
+    try:
+        cache_key = _cache_key(question + str(student_context or ""))
+        cached = cache_manager.get(cache_key)
+        if cached:
+            return cached.get("context"), cached.get("source")
+        
+        logger.info(f"Retrieving context with filter for question: {question[:100]}")
+        
+        # Get documents with basic retrieval
+        retrieved_docs = retriever.invoke(question)
+        
+        if not retrieved_docs:
+            logger.warning("No documents retrieved from vectorstore")
+            return None, "LLM (No RAG)"
+        
+        # Filter by context if provided
+        if student_context:
+            filtered_docs = []
+            
+            for doc in retrieved_docs:
+                metadata = doc.metadata
+                
+                # Filter by plan version
+                if "plan_version" in student_context:
+                    doc_version = metadata.get("plan_version", "unknown")
+                    student_version = student_context["plan_version"]
+                    
+                    # Match exact version or "all" or "unknown"
+                    if doc_version not in [student_version, "all", "unknown"]:
+                        continue
+                
+                # Filter by major (if available in metadata)
+                if "major" in student_context and "major" in metadata:
+                    if metadata["major"] != student_context["major"]:
+                        continue
+                
+                # Filter by status (only active documents)
+                if metadata.get("status") not in ["active", None]:
+                    continue
+                
+                filtered_docs.append(doc)
+            
+            # Use filtered docs if any, otherwise use all
+            if filtered_docs:
+                retrieved_docs = filtered_docs
+                logger.info(f"Filtered to {len(filtered_docs)} documents based on context")
+        
+        logger.info(f"Retrieved {len(retrieved_docs)} documents")
+        source_info = ", ".join(list(set([doc.metadata.get("source", "Unknown") for doc in retrieved_docs])))
+        context_str = "\n\n---\n\n".join([doc.page_content for doc in retrieved_docs])
+        
+        logger.info(f"Context length: {len(context_str)} characters from sources: {source_info}")
+        response_payload = {"context": context_str, "source": f"RAG ({source_info})"}
+        cache_manager.set(cache_key, response_payload, ttl_seconds=CACHE_TTL_SECONDS)
+        return response_payload["context"], response_payload["source"]
+        
+    except Exception as e:
+        logger.error(f"Error retrieving context with filter: {e}", exc_info=True)
+        return None, "LLM (RAG Error)"
